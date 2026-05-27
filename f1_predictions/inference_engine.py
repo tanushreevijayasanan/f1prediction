@@ -1,8 +1,7 @@
-import sys, os, pickle, argparse, logging, time, hashlib, json
-import re
+import sys, os, logging, time, re
 from datetime import datetime, timezone
-from collections import defaultdict, deque
-from typing import Dict, Optional, List, Any
+from collections import defaultdict
+from typing import Dict, Optional, List
 
 import numpy as np
 import pandas as pd
@@ -25,48 +24,44 @@ except Exception as e:
     CONFIG = {}
     get = lambda path, default=None: default
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--log",         default=None)
-parser.add_argument("--alerts-only", action="store_true")
-parser.add_argument("--no-clear",    action="store_true")
-parser.add_argument("--history",     type=int, default=10)
-parser.add_argument("--fan-insights", dest="fan_insights", action="store_true", default=True)
-parser.add_argument("--no-commentary", dest="fan_insights", action="store_false")
-parser.add_argument("--clickhouse-live", action="store_true",
-                    help="Poll ClickHouse raw_telemetry table for new laps and render live")
-parser.add_argument("--event",   default=os.getenv("F1_EVENT", ""))
-parser.add_argument("--year",    type=int, default=int(os.getenv("F1_YEAR", "0") or 0))
-parser.add_argument("--session", default=os.getenv("F1_SESSION", "R"))
-parser.add_argument("--ch-host", default=os.getenv("CH_HOST", "localhost"))
-parser.add_argument("--ch-port", type=int, default=int(os.getenv("CH_PORT", "8123")))
-parser.add_argument("--poll-interval-ms", type=int, default=1000)
-parser.add_argument("--lap-buffer", type=int, default=1)
-parser.add_argument("--start-lap", type=int, default=0,
-                    help="First lap to emit. 0 (default) = skip pre-existing ClickHouse data and only process new laps.")
-parser.add_argument("--tick-seconds", type=int, default=0,
-                    help="Emit predictions every N seconds of wall-clock time. ClickHouse live mode only.")
-parser.add_argument("--write-preds", action="store_true",
-                    help="Write predictions to ClickHouse after each emit.")
-parser.add_argument("--preds-table", default=os.getenv("PRED_TABLE", "prediction_results"), help="ClickHouse predictions table name")
-parser.add_argument("--grid-prior-laps", type=int, default=3,
-                    help="Use qualifying grid as primary order for the first N laps.")
-parser.add_argument("--grid-blend-laps", type=int, default=20,                                               
-                    help="Blend out qualifying grid influence by this lap.")
-parser.add_argument("--grid-prior-weight", type=float, default=0.95,
-                    help="Max weight of qualifying grid in speed-rank blend (0-1).")
-parser.add_argument("--grid-position-regularization", type=float, default=0.15,
-                    help="Residual grid influence weight after blend laps (0-1). Prevents impossible overtakes.")
-parser.add_argument("--min-active-for-speed-rank", type=int, default=10,
-                    help="If fewer active cars than this, fall back to grid ordering.")
-parser.add_argument("--speed-rank-ema", type=float, default=0.35,
-                    help="EMA alpha for speed-rank stability (0-1). Lower = smoother.")
-parser.add_argument("--win-proba-ema", type=float, default=0.20,
-                    help="EMA alpha for win probability stability (0-1). Lower = smoother.")
-parser.add_argument("--win-proba-max-delta", type=float, default=0.05,
-                    help="Max per-emit change in win probability (fraction, e.g. 0.08 = 8%).")
-parser.add_argument("--ui-backend", default="http://localhost:8000",
-                    help="UI backend URL for pushing commentary (e.g., http://localhost:8000)")
-args = parser.parse_args()
+try:
+    from config import parse_cli_args
+except ImportError:
+    from f1_predictions.config import parse_cli_args
+
+try:
+    from clickhouse_io import (
+        load_prerace_from_clickhouse as io_load_prerace_from_clickhouse,
+        clickhouse_lap_to_rows as io_clickhouse_lap_to_rows,
+        load_cumulative_times as io_load_cumulative_times,
+        clickhouse_max_lap as io_clickhouse_max_lap,
+    )
+except ImportError:
+    from f1_predictions.clickhouse_io import (
+        load_prerace_from_clickhouse as io_load_prerace_from_clickhouse,
+        clickhouse_lap_to_rows as io_clickhouse_lap_to_rows,
+        load_cumulative_times as io_load_cumulative_times,
+        clickhouse_max_lap as io_clickhouse_max_lap,
+    )
+
+try:
+    from models_runtime import load_runtime_artifacts
+except ImportError:
+    from f1_predictions.models_runtime import load_runtime_artifacts
+try:
+    from state import create_initial_state
+except ImportError:
+    from f1_predictions.state import create_initial_state
+try:
+    from constants import RACE_LAPS, COMPOUND_COLOR, COMPOUND_SYMBOL, COMPOUND_DEG_RATE, MEDALS, SPARK_BARS
+except ImportError:
+    from f1_predictions.constants import RACE_LAPS, COMPOUND_COLOR, COMPOUND_SYMBOL, COMPOUND_DEG_RATE, MEDALS, SPARK_BARS
+try:
+    from inference_utils import canonical_event_name, normalize_driver_code, safe_float
+except ImportError:
+    from f1_predictions.inference_utils import canonical_event_name, normalize_driver_code, safe_float
+
+args = parse_cli_args()
 HISTORY_WINDOW = args.history
 if args.log:
     logging.basicConfig(filename=args.log, level=logging.INFO,
@@ -92,8 +87,6 @@ MODEL_DIR = os.getenv("MODEL_DIR", os.path.join(_BASE_DIR, "models"))
                                  
 _pred_client = None
 _pred_table = None
-MODEL_HASH_MANIFEST = os.getenv("MODEL_HASH_MANIFEST", "").strip()
-MODEL_HASH_STRICT = os.getenv("MODEL_HASH_STRICT", "0").strip().lower() in {"1", "true", "yes"}
 UI_API_TOKEN = os.getenv("UI_API_TOKEN", "").strip()
 
 
@@ -101,123 +94,55 @@ def _is_safe_identifier(name: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", str(name or "")))
 
 
-def _verify_artifact_hash(path: str) -> None:
-    if not MODEL_HASH_MANIFEST:
-        return
-    try:
-        with open(MODEL_HASH_MANIFEST, "r", encoding="utf-8") as f:
-            manifest = json.load(f)
-        expected = str(manifest.get(os.path.basename(path), "")).strip().lower()
-        if not expected:
-            msg = f"Artifact hash missing in manifest for {os.path.basename(path)}"
-            if MODEL_HASH_STRICT:
-                raise ValueError(msg)
-            logging.warning(msg)
-            return
-        h = hashlib.sha256()
-        with open(path, "rb") as rf:
-            for chunk in iter(lambda: rf.read(8192), b""):
-                h.update(chunk)
-        actual = h.hexdigest().lower()
-        if actual != expected:
-            raise ValueError(f"Artifact hash mismatch for {os.path.basename(path)}")
-    except Exception as e:
-        if MODEL_HASH_STRICT:
-            raise
-        logging.warning(f"Artifact hash verification warning: {e}")
+def _status_msg(msg: str, color: str = "green") -> None:
+    (console.print(f"[{color}]{msg}[/{color}]") if HAS_RICH else print(msg))
 
-def load_pickle(name: str):
-    path = os.path.join(MODEL_DIR, name)
-    if not os.path.isfile(path):
-        msg = f"✗ Missing model file: {path}"
-        (console.print(f"[red]{msg}[/red]") if HAS_RICH else print(msg))
-        sys.exit(1)
-    _verify_artifact_hash(path)
-    with open(path, "rb") as f:
-        return pickle.load(f)
-                                                                         
+
+def _warn_msg(msg: str) -> None:
+    _status_msg(msg, "yellow")
+
+
+def _fail_msg(msg: str) -> None:
+    _status_msg(msg, "red")
+
+
 try:
-    winner_model         = load_pickle("winner_model.pkl")
-    tire_model           = load_pickle("tire_model.pkl")
-    pit_model            = load_pickle("pit_model.pkl")
-    pace_model           = load_pickle("pace_model.pkl")
-    le_team              = load_pickle("team_encoder.pkl")
-    COMPOUND_CLASSES     = load_pickle("compound_classes.pkl")
-    MEDIAN_STINT_LENGTHS = load_pickle("median_stint_lengths.pkl")
-    WINNER_FEATS         = load_pickle("winner_feats.pkl")
-    TIRE_FEATS           = load_pickle("tire_feats.pkl")
-    PIT_FEATS            = load_pickle("pit_feats.pkl")
-    SC_THRESHOLD         = load_pickle("sc_speed_threshold.pkl")
-    TRACK_TYPE_MAP       = load_pickle("track_type_map.pkl")
-    TRACK_TYPE_ENCODER   = load_pickle("track_type_encoder.pkl")
-    PIT_HORIZON          = load_pickle("pit_horizon.pkl")
-    msg = f"✓ Models loaded from {MODEL_DIR}  (pit horizon={PIT_HORIZON} laps)"
-    (console.print(f"[green]{msg}[/green]") if HAS_RICH else print(msg))
-    required = {"laps_remaining", "speed_rank_pct", "delta_vs_field"}
-    missing = required - set(WINNER_FEATS)
-    assert not missing, f"Retrain needed — missing WINNER_FEATS: {missing}"
-    assert "must_change_compound" in PIT_FEATS, "Retrain needed — must_change_compound not in PIT_FEATS"
-    assert "hard_brake_rate" in PIT_FEATS, "Retrain needed — hard_brake_rate not in PIT_FEATS"
+    _artifacts = load_runtime_artifacts(
+        model_dir=MODEL_DIR,
+        manifest_path=os.getenv("MODEL_HASH_MANIFEST", "").strip(),
+        strict=os.getenv("MODEL_HASH_STRICT", "0").strip().lower() in {"1", "true", "yes"},
+        status=lambda m: _status_msg(m, "green"),
+        fail=_fail_msg,
+        warn=_warn_msg,
+    )
 except SystemExit:
     raise
 except Exception as e:
-    msg = f"✗ Model loading failed: {e}"
-    (console.print(f"[red]{msg}[/red]") if HAS_RICH else print(msg))
+    _fail_msg(f"✗ Model loading failed: {e}")
     sys.exit(1)
 
-                                               
-PIT_ALERT_THRESHOLD = 0.40
-_pit_thr_path = os.path.join(MODEL_DIR, "pit_threshold.pkl")
-if os.path.isfile(_pit_thr_path):
-    try:
-        _verify_artifact_hash(_pit_thr_path)
-        with open(_pit_thr_path, "rb") as f:
-            PIT_ALERT_THRESHOLD = float(pickle.load(f))
-        msg = f"✓ Pit threshold loaded: {PIT_ALERT_THRESHOLD:.2f}"
-        (console.print(f"[green]{msg}[/green]") if HAS_RICH else print(msg))
-    except Exception as e:
-        msg = f"⚠ Pit threshold load failed: {e}"
-        (console.print(f"[yellow]{msg}[/yellow]") if HAS_RICH else print(msg))
-
-                              
-laptime_model    = load_pickle("laptime_model.pkl")
-LAPTIME_FEATS    = load_pickle("laptime_feats.pkl")
-CIRCUIT_LENGTHS  = load_pickle("circuit_lengths.pkl")
-LAPTIME_MAE_S    = load_pickle("laptime_mae_s.pkl")
-
-                                                                     
-                                                                
-RACE_LAPS = {
-    "Abu Dhabi Grand Prix": 58, "Australian Grand Prix": 58,
-    "Austrian Grand Prix": 71, "Azerbaijan Grand Prix": 51,
-    "Bahrain Grand Prix": 57, "Belgian Grand Prix": 44,
-    "British Grand Prix": 52, "Canadian Grand Prix": 70,
-    "Chinese Grand Prix": 56, "Dutch Grand Prix": 72,
-    "Emilia Romagna Grand Prix": 63, "Hungarian Grand Prix": 70,
-    "Italian Grand Prix": 53, "Japanese Grand Prix": 53,
-    "Las Vegas Grand Prix": 50, "Mexico City Grand Prix": 71,
-    "Miami Grand Prix": 57, "Monaco Grand Prix": 78,
-    "Qatar Grand Prix": 57, "Saudi Arabian Grand Prix": 50,
-    "Singapore Grand Prix": 62, "Spanish Grand Prix": 66,
-    "São Paulo Grand Prix": 71, "United States Grand Prix": 56,
-}
-
-_lt_status = "lap time model loaded (required)"
-(console.print(f"[green]{_lt_status}[/]") if HAS_RICH else print(_lt_status))
-
-                                                                                    
-try:
-    ranking_model = load_pickle("ranking_model.pkl")
-    RANKING_FEATS = load_pickle("ranking_feats.pkl")
-    msg = f"✓ Ranking distribution model loaded (enables Monte Carlo simulation)"
-    (console.print(f"[green]{msg}[/green]") if HAS_RICH else print(msg))
-    HAS_RANKING_MODEL = True
-except Exception as e:
-    msg = f"⚠ Ranking model not available: {e} (Monte Carlo disabled)"
-    (console.print(f"[yellow]{msg}[/yellow]") if HAS_RICH else print(msg))
-    HAS_RANKING_MODEL = False
-
-                              
+winner_model = _artifacts.winner_model
+tire_model = _artifacts.tire_model
+pit_model = _artifacts.pit_model
+pace_model = _artifacts.pace_model
+le_team = _artifacts.le_team
+COMPOUND_CLASSES = _artifacts.compound_classes
+MEDIAN_STINT_LENGTHS = _artifacts.median_stint_lengths
+WINNER_FEATS = _artifacts.winner_feats
+TIRE_FEATS = _artifacts.tire_feats
+PIT_FEATS = _artifacts.pit_feats
+SC_THRESHOLD = _artifacts.sc_threshold
+TRACK_TYPE_MAP = _artifacts.track_type_map
+TRACK_TYPE_ENCODER = _artifacts.track_type_encoder
+PIT_HORIZON = _artifacts.pit_horizon
+PIT_ALERT_THRESHOLD = _artifacts.pit_alert_threshold
+laptime_model = _artifacts.laptime_model
+LAPTIME_FEATS = _artifacts.laptime_feats
+CIRCUIT_LENGTHS = _artifacts.circuit_lengths
+LAPTIME_MAE_S = _artifacts.laptime_mae_s
+ranking_model = _artifacts.ranking_model
+RANKING_FEATS = _artifacts.ranking_feats
+HAS_RANKING_MODEL = _artifacts.has_ranking_model
 try:
     from monte_carlo_simulator import MonteCarloRaceSimulator, TireDegradationModel, format_prob_distribution
     HAS_MONTE_CARLO = True
@@ -229,13 +154,6 @@ except ImportError as e:
     (console.print(f"[yellow]{msg}[/yellow]") if HAS_RICH else print(msg))
 
 COMPOUND_MAP = {c: i for i, c in enumerate(COMPOUND_CLASSES)}
-
-COMPOUND_COLOR  = {"SOFT": "bold red", "MEDIUM": "bold yellow", "HARD": "bold white",
-                   "INTER": "bold green", "WET": "bold blue"}
-COMPOUND_SYMBOL = {"SOFT": "S", "MEDIUM": "M", "HARD": "H", "INTER": "I", "WET": "W"}
-COMPOUND_DEG_RATE = {"SOFT": 0.35, "MEDIUM": 0.20, "HARD": 0.12, "INTER": 0.25, "WET": 0.18}
-MEDALS           = {1: "🥇", 2: "🥈", 3: "🥉"}
-SPARK_BARS       = "▁▂▃▄▅▆▇█"
 
                                                
 BLEND_MAX            = get("inference.blend_max", 0.70)
@@ -266,107 +184,116 @@ DNS_DETECT_LAP      = int(get("inference.dns_detect_lap", 5))
 DNF_MISSING_LAPS    = int(get("inference.dnf_missing_laps", 5))
 
                                                                                      
-def _bounded_defaultdict(maxsize, factory=list):
-    """Helper to create defaultdict that stores bounded deques"""
-    class BoundedDefaultDict(defaultdict):
-        def __missing__(self, key):
-            val = deque(maxlen=maxsize)
-            self[key] = val
-            return val
-    return BoundedDefaultDict(factory)
-
-                                
 MEM_LIMIT_SPEEDS = get("inference.state_memory.all_speeds_keep_last", 100)
 MEM_LIMIT_LAP_HIST = get("inference.state_memory.lap_history_keep_last", 30)
 MEM_LIMIT_STINT_SPD = get("inference.state_memory.stint_speeds_keep_last", 50)
 MEM_LIMIT_PIT_HIST = get("inference.state_memory.pit_history_keep_last", 20)
 MEM_LIMIT_POS_HIST = get("inference.state_memory.position_history_keep_last", 50)
 
-state: dict = {
-    "event":             "",
-    "year":              0,
-    "total_laps":        0,
-    "pre_race":          {},
-    "_num_to_code":      {},
-    "current_lap":       0,
-    "n_drivers":         20,
-    "tire_age":          defaultdict(int),
-    "current_compound":  {},
-    "current_stint":     defaultdict(int),
-    "stint_speed_samples": _bounded_defaultdict(MEM_LIMIT_STINT_SPD),                          
-    "stint_ref_speed":   defaultdict(float),
-    "lap_history":       _bounded_defaultdict(MEM_LIMIT_LAP_HIST),                             
-    "pace_trend":        _bounded_defaultdict(MEM_LIMIT_LAP_HIST),                             
-    "obs_deg":           {},
-    "model_deg":         {},
-    "pit_prob":          defaultdict(float),
-    "pit_alert":         defaultdict(bool),
-    "teammate_pitted":   defaultdict(bool),
-    "win_proba":         {},
-    "pace_score":        {},
-    "speed_rank":        {},
-    "speed_rank_ema":    {},
-    "delta_vs_field":    {},
-    "delta_vs_teammate": {},
-                                                  
-    "gap_to_below":      {},
-                                        
-    "position_history":  _bounded_defaultdict(MEM_LIMIT_POS_HIST),                             
-    "constructor_state": defaultdict(dict),
-    "suggestions":       [],
-    "corner_alerts":     [],
-    "pattern_insights":  [],
-    "sc_active":         False,
-    "sc_end_lap":        0,
-    "sc_laps":           0,
-    "race_p75_speed":    0.0,
-    "all_speeds_ever":   deque(maxlen=MEM_LIMIT_SPEEDS),                          
-    "last_rainfall":     None,
-    "compounds_used":    defaultdict(set),
-    "predicted_laptime": {},
-    "current_laptime":   {},
-    "fan_commentary":    [],
-    "speed_collapsed":   set(),
-    "win_proba_ema":     {},
-                                                                     
-    "position_probabilities": {},                                                                          
-    "monte_carlo_results": {},                                         
-    "last_model_eval_lap": 0,                                                   
-                                               
-    "driver_status": {},                                             
-    "active_drivers": set(),                                                  
-    "eligible_drivers": set(),
-    "dnf_lap": {},                                                 
-    "last_seen_lap": defaultdict(int),
-    "inactive_lap_streak": defaultdict(int),
-                                            
-    "drs_proximity": {},                                          
-    "drs_available": {},                                       
-    "weather_state": "CLEAR",                                                
-    "fuel_state": {},                                                          
-    "tire_delta_to_leader": {},                                                    
-    "constructor_delta": {},                                             
-    "damage_estimate": {},                                                
-                                                                                           
-    "cumulative_time":     defaultdict(float),                                                
-    "laps_completed":      defaultdict(int),                                         
-    "_cumul_laps_counted": 0,                                                                  
-}
+state: dict = create_initial_state(
+    mem_limit_speeds=MEM_LIMIT_SPEEDS,
+    mem_limit_lap_hist=MEM_LIMIT_LAP_HIST,
+    mem_limit_stint_spd=MEM_LIMIT_STINT_SPD,
+    mem_limit_pos_hist=MEM_LIMIT_POS_HIST,
+)
+
+# Import new modules for separation of concerns
+try:
+    import utilities
+    import feature_extraction
+    import predictions
+    import state_management
+    import commentary as commentary_module
+except ImportError:
+    import f1_predictions.utilities as utilities
+    import f1_predictions.feature_extraction as feature_extraction
+    import f1_predictions.predictions as predictions
+    import f1_predictions.state_management as state_management
+    import f1_predictions.commentary as commentary_module
+
+# Initialize module contexts
+utilities.set_utilities_context(
+    state=state,
+    CIRCUIT_LENGTHS=CIRCUIT_LENGTHS,
+    MEDIAN_STINT_LENGTHS=MEDIAN_STINT_LENGTHS,
+    GRID_PRIOR_LAPS=GRID_PRIOR_LAPS,
+    GRID_BLEND_LAPS=GRID_BLEND_LAPS,
+    GRID_POSITION_REG=GRID_POSITION_REG,
+    MIN_ACTIVE_FOR_RANK=MIN_ACTIVE_FOR_RANK,
+    SPARK_BARS=SPARK_BARS,
+    COMPOUND_COLOR=COMPOUND_COLOR,
+    COMPOUND_SYMBOL=COMPOUND_SYMBOL,
+)
+
+# Encoding helpers for feature extraction
+def _enc_compound(val: str) -> int:
+    return COMPOUND_MAP.get(str(val).upper().replace("INTERMEDIATE", "INTER"), 0)
+
+def _enc_track_type(event: str) -> int:
+    ev = canonical_event_name(event)
+    t = TRACK_TYPE_MAP.get(ev, "UNKNOWN")
+    try:
+        return int(TRACK_TYPE_ENCODER.transform([t])[0])
+    except Exception:
+        return 0
+
+def _enc_team(val: str) -> int:
+    try:
+        return int(le_team.transform([str(val)])[0])
+    except Exception:
+        return 0
+
+feature_extraction.set_feature_extraction_context(
+    enc_compound=_enc_compound,
+    enc_track_type=_enc_track_type,
+    enc_team=_enc_team,
+    tire_age_pct=utilities.tire_age_pct,
+    stint_len_med=utilities.stint_len_med,
+    hard_brake_rate=utilities.hard_brake_rate,
+    laps_remaining=utilities.laps_remaining,
+    current_stint_clean_speeds=utilities.current_stint_clean_speeds,
+    pace_drop_from_clean=utilities.pace_drop_from_clean,
+    state=state,
+)
+
+state_management.set_state_management_context(
+    state=state,
+    is_sc_lap_fn=utilities.is_sc_lap,
+    SC_THRESHOLD=SC_THRESHOLD,
+    SC_FIELD_DROP=SC_FIELD_DROP,
+    RAINFALL_ONSET_DELTA=RAINFALL_ONSET_DELTA,
+    log=log,
+)
+
+predictions.set_predictions_context(
+    HAS_RANKING_MODEL=HAS_RANKING_MODEL,
+    HAS_MONTE_CARLO=HAS_MONTE_CARLO,
+    ranking_model=ranking_model,
+    laptime_model=laptime_model,
+    pit_model=pit_model,
+    RANKING_FEATS=RANKING_FEATS,
+    LAPTIME_FEATS=LAPTIME_FEATS,
+    state=state,
+    log=log,
+)
+
+commentary_module.set_commentary_context(
+    state=state,
+    HAS_NLTK=HAS_NLTK,
+    wordpunct_tokenize=wordpunct_tokenize,
+    nltk_stemmer=_nltk_stemmer,
+    get_current_laptime_fn=utilities.get_current_laptime,
+    get_formatted_team_fn=utilities.get_formatted_team,
+    laptime_str_fn=utilities.laptime_str,
+)
 
                                                                                 
 
 def _enc_compound(val: str) -> int:
     return COMPOUND_MAP.get(str(val).upper().replace("INTERMEDIATE", "INTER"), 0)
 
-def _normalize_event_name(event: str) -> str:
-    if not isinstance(event, str):
-        return str(event)
-    return event.replace("S\u00e3o", "Sao")
-
 def _canonical_event_name(event: str) -> str:
-    """Normalize env/CLI event names (e.g. Miami_Grand_Prix -> Miami Grand Prix)."""
-    ev = _normalize_event_name(str(event or "").strip().replace("_", " "))
-    return re.sub(r"\s+", " ", ev).strip()
+    return canonical_event_name(event)
 
 def _enc_track_type(event: str) -> int:
     ev = _canonical_event_name(event)
@@ -386,19 +313,20 @@ def _predict(feats: dict, cols: list) -> pd.DataFrame:
     return pd.DataFrame([feats])[cols].fillna(0)
 
 
-def _normalize_driver_code(val: Any) -> str:
-    code = str(val or "").strip().upper()
-    if len(code) == 3 and code.isalpha():
-        return code
-    return ""
+def _normalize_driver_code(val) -> str:
+    """Wrapper for inference_utils.normalize_driver_code"""
+    return normalize_driver_code(val)
 
+def _safe_float(v, default=0.0) -> float:
+    """Wrapper for inference_utils.safe_float"""
+    return safe_float(v, default=default)
 
 def _driver_code_from_row(row: dict) -> str:
+    """Extract driver code from telemetry row"""
     for field in ("driver_code", "driver_name"):
         code = _normalize_driver_code(row.get(field))
         if code:
             return code
-
     driver_num = str(row.get("driver_num") or row.get("driver") or "").strip()
     if driver_num:
         mapped = _normalize_driver_code(state.get("_num_to_code", {}).get(driver_num))
@@ -406,25 +334,8 @@ def _driver_code_from_row(row: dict) -> str:
             return mapped
     return ""
 
-
-def _safe_float(v, default=0.0) -> float:
-    try:
-        x = float(v)
-        if np.isfinite(x):
-            return x
-    except (TypeError, ValueError):
-        pass
-    return float(default)
-
-
 def _row_is_valid_activity(row: dict) -> bool:
-    """
-    Activity guard for live inference:
-    - require a real driver code
-    - require meaningful speed (>50 km/h)
-    - require at least one non-null telemetry signal so sparse/null rows don't
-      keep retired drivers alive
-    """
+    """Activity guard for live inference"""
     code = _driver_code_from_row(row)
     if not code:
         return False
@@ -437,578 +348,117 @@ def _row_is_valid_activity(row: dict) -> bool:
     )
     return bool(has_signal)
 
+# Utility wrappers that delegate to the utilities module
 def _sparkline(values: list, width: int = 10) -> str:
-    if not values:
-        return ""
-    chunk = values[-width:]
-    lo, hi = min(chunk), max(chunk)
-    span = hi - lo or 1
-    return "".join(SPARK_BARS[min(7, int((v - lo) / span * 7))] for v in chunk)
+    return utilities.sparkline(values, width)
 
 def _grid_rank_map(codes: list[str]) -> dict:
-    """
-    Qualifying grid order as a rank pct in [0,1].
-    Lower grid_position => better rank (smaller pct).
-    """
-    if not codes:
-        return {}
-    keyed = []
-    for c in codes:
-        pr = state["pre_race"].get(c, {})
-        gp = pr.get("grid_position", 999)
-        try:
-            gp = int(gp)
-        except Exception:
-            gp = 999
-        keyed.append((gp, c))
-    keyed.sort(key=lambda x: (x[0], x[1]))
-    n = len(keyed)
-    return {c: (i + 1) / max(n, 1) for i, (_, c) in enumerate(keyed)}
+    return utilities.grid_rank_map(codes)
 
 def _grid_blend_weight(lap_no: int, n_active: int) -> float:
-    """
-    Weight for qualifying grid prior in speed-rank.
-    1.0 at/before GRID_PRIOR_LAPS, then linearly decays to GRID_POSITION_REG by GRID_BLEND_LAPS.
-    After GRID_BLEND_LAPS, retains residual GRID_POSITION_REG influence to prevent impossible
-    overtakes (e.g., P20 can't suddenly be faster than top 3 on a single lap).
-    """
-    if n_active < MIN_ACTIVE_FOR_RANK:
-        return 1.0
-    if GRID_BLEND_LAPS <= 0:
-        return GRID_POSITION_REG                                          
-    if lap_no <= GRID_PRIOR_LAPS:
-        return 1.0
-    if lap_no >= GRID_BLEND_LAPS:
-        return GRID_POSITION_REG                                         
-    
-                                                     
-    span = max(GRID_BLEND_LAPS - GRID_PRIOR_LAPS, 1)
-    fraction = (lap_no - GRID_PRIOR_LAPS) / span
-    return 1.0 - (fraction * (1.0 - GRID_POSITION_REG))
+    return utilities.grid_blend_weight(lap_no, n_active)
 
 def _laps_remaining(lap_no: int) -> int:
-    return max(0, state["total_laps"] - lap_no)
+    return utilities.laps_remaining(lap_no)
 
 def _tire_age_pct(compound: str, age: int) -> float:
-    median = MEDIAN_STINT_LENGTHS.get(compound.upper().replace("INTERMEDIATE", "INTER"), 25.0)
-    return age / median if median > 0 else 0.0
+    return utilities.tire_age_pct(compound, age)
 
 def _stint_len_med(compound: str) -> float:
-    return float(MEDIAN_STINT_LENGTHS.get(compound.upper().replace("INTERMEDIATE", "INTER"), 25.0))
+    return utilities.stint_len_med(compound)
 
 def _hard_brake_rate(hard_brake_count: float, avg_speed: float) -> float:
-    return hard_brake_count / max(avg_speed, 1.0) * 100.0
+    return utilities.hard_brake_rate(hard_brake_count, avg_speed)
 
 def _speed_to_laptime(speed_kmh: float, event: str) -> float:
-    circuit_m = CIRCUIT_LENGTHS.get(event, 5300.0)
-    if speed_kmh <= 0:
-        return 0.0
-    return circuit_m / (speed_kmh / 3.6)
+    return utilities.speed_to_laptime(speed_kmh, event)
 
 def _laptime_str(lt_s: float) -> str:
-    if lt_s <= 0:
-        return "—"
-    m  = int(lt_s // 60)
-    s  = lt_s - m * 60
-    return f"{m}:{s:06.3f}"
+    return utilities.laptime_str(lt_s)
 
 def _lt(code: str) -> float:
-    return state["current_laptime"].get(code, 0.0)
+    return utilities.get_current_laptime(code)
 
 def _lt_str(lt_s: float) -> str:
-    return _laptime_str(lt_s)
+    return utilities.laptime_str(lt_s)
 
 def _fteam(code: str) -> str:
-    team = state["pre_race"].get(code, {}).get("team", "")
-    return team if team else code
-
+    return utilities.get_formatted_team(code)
 
 def _current_stint_clean_speeds(code: str) -> list[float]:
-    """
-    [FIX-F2] Return avg_speeds for clean laps in the CURRENT stint only.
-
-    The original code used all of lap_history[code], which spans multiple stints.
-    After a pit stop, laps from the previous stint contaminate pace_drop and
-    rel_speed_delta with cross-stint degradation signals that make the model
-    think the driver is aggressively degrading when they're actually on fresh
-    rubber.
-    """
-    current_stint_id = state["current_stint"][code]
-    hist = state["lap_history"].get(code, [])
-    return [
-        h["avg_speed"]
-        for h in hist
-        if h.get("stint") == current_stint_id
-        and not h.get("is_sc")
-        and h["avg_speed"] > 50
-    ]
-
+    return utilities.current_stint_clean_speeds(code)
 
 def _pace_drop_from_clean(clean_speeds: list[float], n: int = 3) -> float:
-    """
-    Compute pace drop as (mean of first n clean laps) - (mean of last n clean laps)
-    divided by the early mean. Positive = driver is getting slower.
-    Returns 0.0 if not enough data.
-    """
-    if len(clean_speeds) < n * 2:
-        return 0.0
-    early = float(np.mean(clean_speeds[:n]))
-    late  = float(np.mean(clean_speeds[-n:]))
-    return (early - late) / max(early, 1e-6)
-
-
-                                                                                
-
-def _laptime_feats(code: str, comp: str, row: dict, lap_no: int) -> dict:
-    """
-    [FIX-F2] Uses current-stint-only clean speeds for pace_drop_3.
-    [FIX-F4] Uses populated gap_to_below.
-    """
-    age     = state["tire_age"][code]
-    avg_spd = float(row.get("avg_speed") or 0.0)
-    ref_s   = float(state["stint_ref_speed"].get(code, 0.0) or 0.0)
-    rel_d   = ((avg_spd - ref_s) / max(ref_s, 1.0)) if ref_s > 0 and avg_spd > 0 else 0.0
-
-                                            
-    clean = _current_stint_clean_speeds(code)
-    pace_d3 = _pace_drop_from_clean(clean, n=2)
-
-    return {
-        "avg_speed":          avg_spd,
-        "compound_enc":       _enc_compound(comp),
-        "tire_age":           age,
-        "tire_age_pct":       _tire_age_pct(comp, age),
-        "track_type_enc":     _enc_track_type(state["event"]),
-        "rel_speed_delta":    rel_d,
-        "pace_drop_3":        pace_d3,
-        "avg_throttle":       float(row.get("avg_throttle") or 85.0),
-        "avg_brake":          float(row.get("avg_brake") or 5.0),
-        "hard_brake_rate":    _hard_brake_rate(float(row.get("hard_brake_count") or 0), avg_spd),
-        "avg_drs":            float(row.get("avg_drs") or 0.5),
-        "avg_rpm":            float(row.get("avg_rpm") or 10000.0),
-        "track_temp":         float(row.get("track_temp") or 35.0),
-        "air_temp":           float(row.get("air_temp") or 28.0),
-        "rainfall":           float(row.get("rainfall") or 0.0),
-        "laps_remaining":     _laps_remaining(lap_no),
-        "LapNumber":          lap_no,
-        "race_pct":           lap_no / max(state["total_laps"], 1),
-        "speed_rank_pct":     state["speed_rank"].get(code, 0.5),
-        "delta_vs_field":     state["delta_vs_field"].get(code, 0.0),
-                                                              
-        "gap_to_below_proxy": float(state["gap_to_below"].get(code, 0.0)),
-        "teammate_pitted":    int(state["teammate_pitted"].get(code, False)),
-    }
-
+    return utilities.pace_drop_from_clean(clean_speeds, n)
 
 def _field_median_speed(tele_rows: list) -> float:
-    speeds = [float(r.get("avg_speed") or 0) for r in tele_rows if (r.get("avg_speed") or 0) > 50]
-    return float(np.median(speeds)) if speeds else 0.0
+    return utilities.field_median_speed(tele_rows)
 
 def _is_sc_lap(field_median: float) -> bool:
-    if SC_THRESHOLD and SC_THRESHOLD > 0:
-        return field_median < SC_THRESHOLD
-    ref = state["race_p75_speed"]
-    if ref <= 0:
-        return False
-    return field_median < ref * SC_FIELD_DROP
+    return utilities.is_sc_lap(field_median, SC_THRESHOLD, SC_FIELD_DROP)
+
+def _predict(feats: dict, cols: list) -> pd.DataFrame:
+    return pd.DataFrame([feats])[cols].fillna(0)
+
+# Feature extraction wrappers that delegate to the feature_extraction module
+def _laptime_feats(code: str, comp: str, row: dict, lap_no: int) -> dict:
+    return feature_extraction.laptime_feats(code, comp, row, lap_no)
 
 def _must_change_compound(code: str, lap_no: int) -> int:
-    """
-    [FIX-F7] Align with training definition.
-
-    Training used: (Stint == 1) & (race_pct > 0.60)
-    i.e. the driver is still on their FIRST stint past 60% of the race.
-
-    The original inference version used compound-set tracking (len(used) < 2),
-    which diverges from the training label whenever:
-      - A driver pits twice on the same compound (was allowed in certain wet races)
-      - A driver is on Stint 2 with only 1 compound used (same as training intent
-        but the set count is an imperfect proxy)
-
-    We match training exactly: current_stint == 1 AND race_pct > 0.60.
-    Inters/wet bypass as before.
-    """
-    current = state["current_compound"].get(code, "UNKNOWN")
-    if current in ("INTER", "WET"):
-        return 0
-    race_pct = lap_no / max(state["total_laps"], 1)
-    return int(state["current_stint"].get(code, 1) == 1 and race_pct > 0.60)
-
-
-                                                                                
-
-                                                                           
-                                                  
-                                                              
-     
-                                                                            
-                                                                           
-                                                                 
-                                                                               
-                                                                       
-                                                                  
-                                         
-     
-                                               
-                                                                                      
-                                                                                      
-                                                                                     
-                                                                           
-     
-                                                                               
-                                                                                    
-                                                                               
+    return feature_extraction.must_change_compound(code, lap_no)
 
 def _winner_feats(code: str, lap_no: int) -> dict:
-    """
-    Build feature vector for the win probability model.
- 
-    WINNER_FEATS (must match train_winner_model.py exactly):
-      grid_position, grid_position_group, avg_finish_last5, points_last5,
-      dnf_rate_last5, team_enc, best_quali_lap, track_type_enc,
-      laps_remaining, speed_rank_pct, delta_vs_field, tire_age, tire_age_pct,
-      compound_enc, current_position, position_pct, is_leading,
-      sc_active, position_jump_2, position_jump_3, sc_beneficiary,
-      gap_to_leader_s, gap_laps_remaining,
-      lap_progress, is_late_race, gap_urgency, leading_and_late,
-      position_gain_pct, tire_freshness
- 
-    Key fixes vs original:
-      - sc_active: binary SC lap flag (was missing entirely)
-      - position_jump_2/3: positions gained in 2/3 laps (SC beneficiary signal)
-      - gap_to_leader_s: actual seconds behind leader from cumulative-time block
-      - gap_laps_remaining: gap_s / laps_remaining (recovery difficulty)
-      - is_leading: direct binary flag instead of implied by speed_rank_pct
-      - position_history stores integer positions so jumps compute correctly
-    """
-    pr       = state["pre_race"].get(code, {})
-    grid_pos = pr.get("grid_position", 10)
- 
-                                                                          
-    grid_group = 1 if grid_pos <= 5 else (2 if grid_pos <= 15 else 3)
- 
-                                                                                
-                                                                 
-                                                 
-    speed_rank_pct   = state["speed_rank"].get(code, 0.5)
-    n_drivers        = max(state.get("n_drivers", 20), 2)
-    current_position = float(np.clip(speed_rank_pct * n_drivers, 1.0, float(n_drivers)))
-    position_pct     = float(
-        np.clip(1.0 - ((current_position - 1.0) / max(n_drivers - 1, 1)), 0.0, 1.0)
-    )
- 
-                                                 
-    is_leading = int(current_position <= 1.5)
- 
-                                                                                
-    sc_active = int(state.get("sc_active", False))
- 
-                                                       
-                                                                         
-                                                              
-                                             
-    pos_hist = list(state.get("position_history", {}).get(code, []))
- 
-    if len(pos_hist) >= 2:
-        position_jump_2 = float(pos_hist[-2] - current_position)
-    else:
-        position_jump_2 = 0.0
- 
-    if len(pos_hist) >= 3:
-        position_jump_3 = float(pos_hist[-3] - current_position)
-    else:
-        position_jump_3 = 0.0
- 
-                                                                                 
-                                                                             
-                                                        
-    sc_beneficiary = int(sc_active == 1 and position_jump_2 > 2.0)
- 
-                                                                                
-                                                                         
-                                                            
-                                                                        
-    gap_to_leader_s = float(state.get("gap_to_leader", {}).get(code, 0.0))
- 
-                                                                  
-                                                               
-                                                                         
-    laps_remaining     = _laps_remaining(lap_no)
-    gap_laps_remaining = gap_to_leader_s / max(laps_remaining, 1)
- 
-                                                                                
-    total_laps   = max(state.get("total_laps", 53), 1)
-    lap_progress = lap_no / total_laps
-    is_late_race = 1 if lap_no > total_laps * 0.75 else 0
- 
-                                                                                
-    delta_vs_field = float(state["delta_vs_field"].get(code, 0.0))
-    gap_urgency    = delta_vs_field / max(laps_remaining, 1)
- 
-                                                                                
-                                                              
-    leading_and_late = position_pct * lap_progress
- 
-                                                                                
-    comp           = state["current_compound"].get(code, "UNKNOWN")
-    tire_age_pct   = _tire_age_pct(comp, state["tire_age"][code])
-    tire_freshness = 1.0 / (1.0 + tire_age_pct)
- 
-                                                                                
-    position_gain_pct = position_pct - (1.0 - min(grid_pos / 20.0, 1.0))
- 
-    return {
-                                                                                
-        "grid_position":        grid_pos,
-        "grid_position_group":  grid_group,
-        "avg_finish_last5":     pr.get("avg_finish_last5", 10.0),
-        "points_last5":         pr.get("points_last5", 0.0),
-        "dnf_rate_last5":       pr.get("dnf_rate_last5", 0.2),
-        "team_enc":             _enc_team(pr.get("team", "Unknown")),
-        "best_quali_lap":       pr.get("best_quali_lap", 90.0),
-        "track_type_enc":       _enc_track_type(state["event"]),
- 
-                                                                                
-        "laps_remaining":       laps_remaining,
-        "speed_rank_pct":       speed_rank_pct,
-        "delta_vs_field":       delta_vs_field,
-        "tire_age":             state["tire_age"][code],
-        "tire_age_pct":         tire_age_pct,
-        "compound_enc":         _enc_compound(comp),
- 
-                                                                                
-        "current_position":     current_position,                    
-        "position_pct":         position_pct,                            
-        "is_leading":           is_leading,                    
- 
-                                                                                
-        "sc_active":            sc_active,
-        "position_jump_2":      position_jump_2,
-        "position_jump_3":      position_jump_3,
-        "sc_beneficiary":       sc_beneficiary,
- 
-                                                                                
-        "gap_to_leader_s":      gap_to_leader_s,
-        "gap_laps_remaining":   gap_laps_remaining,
- 
-                                                                                
-        "lap_progress":         lap_progress,
-        "is_late_race":         is_late_race,
-        "gap_urgency":          gap_urgency,
-        "leading_and_late":     leading_and_late,
- 
-                                                                                
-        "position_gain_pct":    position_gain_pct,
-        "tire_freshness":       tire_freshness,
-    }
- 
- 
+    return feature_extraction.winner_feats(code, lap_no)
 
 def _tire_feats(code: str, comp: str, row: dict) -> dict:
-    age     = state["tire_age"][code]
-    avg_spd = float(row.get("avg_speed") or 200.0)
-    stint_len = _stint_len_med(comp)
-    clean = _current_stint_clean_speeds(code)
-    pace_d5 = _pace_drop_from_clean(clean, n=3)
-    return {
-        "compound_enc":     _enc_compound(comp),
-        "tire_age":         age,
-        "tire_age_pct":     _tire_age_pct(comp, age),
-        "stint_len_med":    stint_len,
-        "stint_laps_left":  max(0.0, stint_len - age),
-        "stint_progress":   age / max(stint_len, 1.0),
-        "laps_remaining":   _laps_remaining(state["current_lap"]),
-        "LapNumber":        state["current_lap"],
-        "track_type_enc":   _enc_track_type(state["event"]),
-        "avg_throttle":     float(row.get("avg_throttle") or 85.0),
-        "avg_brake":        float(row.get("avg_brake") or 5.0),
-        "hard_brake_rate":  _hard_brake_rate(float(row.get("hard_brake_count") or 0), avg_spd),
-        "avg_drs":          float(row.get("avg_drs") or 0.5),
-        "avg_rpm":          float(row.get("avg_rpm") or 10000.0),
-        "track_temp":       float(row.get("track_temp") or 35.0),
-        "air_temp":         float(row.get("air_temp") or 28.0),
-        "rainfall":         float(row.get("rainfall") or 0),
-        "delta_vs_field":   state["delta_vs_field"].get(code, 0.0),
-        "speed_rank_pct":   state["speed_rank"].get(code, 0.5),
-        "gap_to_below_proxy": float(state["gap_to_below"].get(code, 0.0)),
-        "pace_drop_5":      pace_d5,
-        "delta_vs_teammate": state["delta_vs_teammate"].get(code, 0.0),
-    }
-
+    return feature_extraction.tire_feats(code, comp, row)
 
 def _ranking_feats(code: str, lap_no: int) -> dict:
-    """
-    Build features for ranking distribution model (multinomial finishing position).
-    Uses same core features as winner model but applied to final-lap context.
-    """
-    pr = state["pre_race"].get(code, {})
-    grid_pos = pr.get("grid_position", 10)
-    
-                                                                 
-    speed_rank_pct = state["speed_rank"].get(code, 0.5)
-    n_drivers = max(state.get("n_drivers", 20), 2)
-    current_position = float(np.clip(speed_rank_pct * n_drivers, 1.0, float(n_drivers)))
-    position_pct = float(np.clip(1.0 - ((current_position - 1.0) / max(n_drivers - 1, 1)), 0.0, 1.0))
-    
-    total_laps = state.get("total_laps", 53)
-    lap_progress = lap_no / max(total_laps, 1)
-    
-    delta_vs_field = float(state["delta_vs_field"].get(code, 0.0))
-    laps_remaining = _laps_remaining(lap_no)
-    gap_urgency = delta_vs_field * (1.0 / max(laps_remaining, 1))
-    
-    n_grid = 22.0
-    grid_pct_front = (1.0 - min(grid_pos / n_grid, 1.0))
-    position_gain = position_pct - grid_pct_front
-    
-    tire_age_pct = _tire_age_pct(
-        state["current_compound"].get(code, "UNKNOWN"),
-        state["tire_age"][code]
-    )
-    tire_freshness = 1.0 / (1.0 + tire_age_pct)
-    
-    return {
-        "grid_position":    grid_pos,
-        "avg_finish_last5": pr.get("avg_finish_last5", 10.0),
-        "points_last5":     pr.get("points_last5", 0.0),
-        "dnf_rate_last5":   pr.get("dnf_rate_last5", 0.2),
-        "team_enc":         _enc_team(pr.get("team", "Unknown")),
-        "best_quali_lap":   pr.get("best_quali_lap", 90.0),
-        "track_type_enc":   _enc_track_type(state["event"]),
-        "speed_rank_pct":   speed_rank_pct,
-        "delta_vs_field":   delta_vs_field,
-        "tire_age":         state["tire_age"][code],
-        "tire_age_pct":     tire_age_pct,
-        "compound_enc":     _enc_compound(state["current_compound"].get(code, "UNKNOWN")),
-        "lap_progress":     lap_progress,
-        "gap_urgency":      gap_urgency,
-        "tire_freshness":   tire_freshness,
-        "position_gain_pct": position_gain,
-    }
+    return feature_extraction.ranking_feats(code, lap_no)
 
 def _pit_feats(code: str, comp: str, row: dict, lap_no: int) -> dict:
-    """
-    [FIX-F2] pace_drop_5 uses current-stint-only clean speeds.
-    [FIX-F4] gap_to_below_proxy now populated from state.
-    [FIX-F7] must_change_compound aligned with training.
-    """
-    feats = _tire_feats(code, comp, row)
-    feats["Stint"]                = int(state["current_stint"].get(code, 1))
-    feats["teammate_pitted"]      = int(state["teammate_pitted"].get(code, False))
-    feats["must_change_compound"] = _must_change_compound(code, lap_no)
-    feats["track_type_enc"]       = _enc_track_type(state["event"])
-                                             
-    feats["gap_to_below_proxy"]   = float(state["gap_to_below"].get(code, 0.0))
-
-    avg_s = float(row.get("avg_speed") or 0.0)
-    ref_s = float(state["stint_ref_speed"].get(code, 0.0) or 0.0)
-    feats["rel_speed_delta"] = ((avg_s - ref_s) / max(ref_s, 1.0)) if ref_s > 0 and avg_s > 0 else 0.0
-
-                                 
-    clean = _current_stint_clean_speeds(code)
-    feats["pace_drop_5"] = _pace_drop_from_clean(clean, n=3)
-
-    return feats
+    return feature_extraction.pit_feats(code, comp, row, lap_no)
 
 
-                                                                                
 
+
+# State management wrappers that delegate to the state_management module
+def _update_sc_state(tele_rows: list, lap_no: int) -> None:
+    state_management.update_sc_state(tele_rows, lap_no)
+
+def _check_weather(tele_rows: list, lap_no: int) -> None:
+    state_management.check_weather(tele_rows, lap_no)
+
+# Prediction wrappers that delegate to the predictions module
 def _compute_ranking_probabilities(lap_no: int) -> Dict[str, Dict[str, float]]:
-    """
-    Compute finishing position probability distributions using ranking model.
+    result = predictions.compute_ranking_probabilities(lap_no, _ranking_feats, _predict)
     
-    For each driver, outputs:
-    - p1, p2, ..., p20: finish position probabilities
-    - podium: P(finish ≤ 3)
-    - top5: P(finish ≤ 5)
-    - top10: P(finish ≤ 10)
-    - points: P(finish ≤ 10) [F1 points awarded to top 10]
-    - expected_position: E[finishing position]
-    - win_probability: same as p1
-    
-    [FIX-DNF] Skip drivers with status != "ACTIVE"
-    Returns: {driver_code -> {metric_name -> probability}}
-    """
-    if not HAS_RANKING_MODEL:
+    # Additional calibration logic specific to inference_engine
+    if not result:
         return {}
     
-    result = {}
-                                                             
-    active_only = {c: state["driver_status"].get(c, "ACTIVE") == "ACTIVE" 
-                   for c in state["pre_race"].keys()}
-    
-    try:
-        for code in state["active_drivers"]:
-            if not active_only.get(code, True):
-                continue
-
-            feats = _ranking_feats(code, lap_no)
-            feat_df = pd.DataFrame([feats])[RANKING_FEATS].fillna(0)
-
-                                                                                      
-                                                                                      
-                                                                                      
-            prob_dist = ranking_model.predict_proba(feat_df)[0]
-            n_classes = len(prob_dist)                                           
-
-                                                                            
-            position_probs = {f"p{i+1}": float(prob_dist[i]) for i in range(n_classes)}
-                                                                                   
-            for i in range(n_classes, 20):
-                position_probs[f"p{i+1}"] = 0.0
-
-                                                                      
-            podium_p   = float(sum(prob_dist[0:min(3,  n_classes)]))
-            top5_p     = float(sum(prob_dist[0:min(5,  n_classes)]))
-            top10_p    = float(sum(prob_dist[0:min(10, n_classes)]))
-            expected_pos = float(sum((i + 1) * p for i, p in enumerate(prob_dist)))
-
-            result[code] = {
-                **position_probs,
-                "podium":            podium_p,
-                "top5":              top5_p,
-                "top10":             top10_p,
-                "points":            top10_p,
-                "expected_position": expected_pos,                                   
-                "win_probability":   float(prob_dist[0]),
-            }
-
-                                                                             
-                                                                         
-                                                                            
-                                                             
-        total_laps = max(state.get("total_laps", 53), 1)
-        race_pct   = lap_no / total_laps
-                                                                                 
-        grid_alpha = max(0.25, 1.0 - race_pct * 1.5)
-
-                                                                 
-        dnf_codes = {c for c, s in state["driver_status"].items() if s in ("DNF", "DNS")}
-        n_active_drivers = max(len(result), 1)
-
-        for code in list(result.keys()):
-            pr = state["pre_race"].get(code, {})
-            grid_pos = pr.get("grid_position", 10)
-            raw_model_pos = result[code]["expected_position"]
-
-                                                                   
-            blended = grid_alpha * grid_pos + (1.0 - grid_alpha) * raw_model_pos
-
-                                  
-            blended = max(1.0, min(float(n_active_drivers), blended))
-            result[code]["expected_position"] = blended
-
-    except Exception as e:
-        logger.warning(f"Ranking model inference failed: {e}")
-        return {}
-    
-                                                                   
-
-                                            
     for code in state["driver_status"].keys():
         if code not in result and state["driver_status"].get(code) in ("DNF", "DNS"):
             result[code] = {f"p{i+1}": 0.0 for i in range(20)}
-            result[code]["status"]  = state["driver_status"][code]
+            result[code]["status"] = state["driver_status"][code]
+    
+    return predictions.calibrate_late_race_probabilities(result, lap_no, state["total_laps"], log)
+
+def _calibrate_late_race_probabilities(result: Dict[str, Any], lap_no: int, total_laps: int) -> Dict[str, Any]:
+    return predictions.calibrate_late_race_probabilities(result, lap_no, total_laps, log)
+
+def _run_monte_carlo_simulation(lap_no: int, n_simulations: int = 500) -> Dict[str, Dict[str, float]]:
+    try:
+        from monte_carlo_simulator import MonteCarloRaceSimulator, TireDegradationModel
+        return predictions.run_monte_carlo_simulation(lap_no, MonteCarloRaceSimulator, TireDegradationModel, n_simulations)
+    except ImportError:
+        try:
+            from f1_predictions.monte_carlo_simulator import MonteCarloRaceSimulator, TireDegradationModel
+            return predictions.run_monte_carlo_simulation(lap_no, MonteCarloRaceSimulator, TireDegradationModel, n_simulations)
+        except ImportError:
+            return {}
+
+
             result[code]["dnf_lap"] = state["dnf_lap"].get(code, 0)
     
     return result
@@ -2424,357 +1874,48 @@ def _plain(lap_no: int) -> None:
                                                                                 
 
 def _load_prerace_from_clickhouse(ch, event: str, year: int, session: str):
-    event = _canonical_event_name(event)
-                                                                    
-    try:
-        driver_map_df = ch.query_df(
-            """
-            SELECT
-                toString(r.driver)  AS driver_num,
-                r.driver_code,
-                r.final_position,
-                r.status,
-                q.team,
-                q.grid_position,
-                q.best_quali_lap
-            FROM f1_race_results r
-            LEFT JOIN qualifying_results q
-                ON  r.driver_code = q.driver_code
-                AND r.event       = q.event
-                AND r.year        = q.year
-            WHERE r.event = {event:String}
-              AND r.year  = {year:Int32}
-            """,
-            parameters={"event": event, "year": int(year)}
-        )
-    except Exception:
-        driver_map_df = None
-
-    num_to_code = {}
-    if driver_map_df is not None and not driver_map_df.empty:
-        num_to_code = dict(zip(driver_map_df["driver_num"], driver_map_df["driver_code"]))
-
-                       
-    pre_race_ctx: dict = {}
-    try:
-        feat_df = ch.query_df(
-            """
-            SELECT
-                f.driver_code,
-                f.team,
-                f.grid_position,
-                f.avg_finish_last5,
-                f.points_last5,
-                f.dnf_rate_last5,
-                q.best_quali_lap
-            FROM f1_features f
-            LEFT JOIN qualifying_results q
-                ON  f.driver_code = q.driver_code
-                AND f.event       = q.event
-                AND f.year        = q.year
-            WHERE f.event = {event:String}
-              AND f.year  = {year:Int32}
-            """,
-            parameters={"event": event, "year": int(year)}
-        )
-
-        for _, row in feat_df.iterrows():
-            code = str(row.driver_code)
-            pre_race_ctx[code] = dict(
-                driver_code      = code,
-                team             = str(row.team),
-                grid_position    = int(row.grid_position),
-                avg_finish_last5 = float(row.avg_finish_last5),
-                points_last5     = float(row.points_last5),
-                dnf_rate_last5   = float(row.dnf_rate_last5),
-                best_quali_lap   = float(row.best_quali_lap) if pd.notna(row.best_quali_lap) else 90.0,
-                final_position   = None,
-                final_status     = "",
-            )
-    except Exception:
-        pass
-
-                                          
-    try:
-        quali_df = ch.query_df(
-            """
-            SELECT
-                toString(driver) AS driver_num,
-                driver_code,
-                team,
-                grid_position,
-                best_quali_lap
-            FROM qualifying_results
-            WHERE event = {event:String}
-              AND year  = {year:Int32}
-            """,
-            parameters={"event": event, "year": int(year)}
-        )
-        for _, row in quali_df.iterrows():
-            code = str(row.driver_code)
-            num = str(row.driver_num) if pd.notna(row.driver_num) else ""
-            if num and code:
-                num_to_code[num] = code
-            if code not in pre_race_ctx:
-                pre_race_ctx[code] = dict(
-                    driver_code      = code,
-                    team             = str(row.team) if pd.notna(row.team) else "Unknown",
-                    grid_position    = int(row.grid_position) if pd.notna(row.grid_position) else 10,
-                    avg_finish_last5 = 10.0,
-                    points_last5     = 0.0,
-                    dnf_rate_last5   = 0.2,
-                    best_quali_lap   = float(row.best_quali_lap) if pd.notna(row.best_quali_lap) else 90.0,
-                    final_position   = None,
-                    final_status     = "",
-                )
-            else:
-                if pd.notna(row.grid_position):
-                    pre_race_ctx[code]["grid_position"] = int(row.grid_position)
-                if pd.notna(row.best_quali_lap):
-                    pre_race_ctx[code]["best_quali_lap"] = float(row.best_quali_lap)
-                if pd.notna(row.team) and row.team:
-                    pre_race_ctx[code]["team"] = str(row.team)
-    except Exception:
-        pass
-
-    if driver_map_df is not None and not driver_map_df.empty:
-        for _, row in driver_map_df.iterrows():
-            code = str(row.driver_code)
-            if code not in pre_race_ctx:
-                pre_race_ctx[code] = dict(
-                    driver_code=code,
-                    team=str(row.team) if pd.notna(row.team) else "Unknown",
-                    grid_position=10,
-                    avg_finish_last5=10.0,
-                    points_last5=0.0,
-                    dnf_rate_last5=0.2,
-                    best_quali_lap=90.0,
-                )
-            pre_race_ctx[code]["final_position"] = (
-                int(row.final_position) if pd.notna(row.final_position) else None
-            )
-            pre_race_ctx[code]["final_status"] = str(row.status) if pd.notna(row.status) else ""
-
-    if not num_to_code:
-        import glob
-        csv_event = event.replace(" ", "_")
-        search_dirs = [
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "src", "main", "java", "f1producer",
-                         "raw_telemetry_per_driver"),
-            os.environ.get("DATASET_ROOT", ""),
-        ]
-        for d in search_dirs:
-            if not d or not os.path.isdir(d):
-                continue
-            pattern = os.path.join(d, f"{year}_{csv_event}_qualifying_results.csv")
-            matches = glob.glob(pattern)
-            if not matches:
-                continue
-            try:
-                quali_csv = pd.read_csv(matches[0])
-                for _, row in quali_csv.iterrows():
-                    num = str(int(row["driver"])) if pd.notna(row.get("driver")) else ""
-                    code = str(row.get("driver_code", "")).strip()
-                    if num and code and len(code) == 3:
-                        num_to_code[num] = code
-                        if code not in pre_race_ctx:
-                            pre_race_ctx[code] = dict(
-                                driver_code      = code,
-                                team             = str(row.get("team", "Unknown")),
-                                grid_position    = int(row["grid_position"]) if pd.notna(row.get("grid_position")) else 10,
-                                avg_finish_last5 = 10.0,
-                                points_last5     = 0.0,
-                                dnf_rate_last5   = 0.2,
-                                best_quali_lap   = float(row["best_quali_lap"]) if pd.notna(row.get("best_quali_lap")) else 90.0,
-                            )
-                        else:
-                            if pd.notna(row.get("team")) and row["team"]:
-                                pre_race_ctx[code]["team"] = str(row["team"])
-                            if pd.notna(row.get("grid_position")):
-                                pre_race_ctx[code]["grid_position"] = int(row["grid_position"])
-                            if pd.notna(row.get("best_quali_lap")):
-                                pre_race_ctx[code]["best_quali_lap"] = float(row["best_quali_lap"])
-                print(f"  ✓ Loaded {len(num_to_code)} driver mappings from qualifying CSV")
-                break
-            except Exception as e:
-                print(f"  ⚠ Failed to load qualifying CSV: {e}")
-
-    try:
-        drv_df = ch.query_df(
-            """
-            SELECT DISTINCT
-                toString(driver) AS driver_num
-            FROM raw_telemetry
-            WHERE event   = {event:String}
-              AND year    = {year:Int32}
-              AND session = {session:String}
-            """,
-            parameters={"event": event, "year": int(year), "session": str(session)}
-        )
-        for _, row in drv_df.iterrows():
-            raw_num = str(row.driver_num).strip()
-            code = num_to_code.get(raw_num, raw_num)
-            if code not in pre_race_ctx:
-                pre_race_ctx[code] = dict(
-                    driver_code      = code,
-                    team             = "Unknown",
-                    grid_position    = 10,
-                    avg_finish_last5 = 10.0,
-                    points_last5     = 0.0,
-                    dnf_rate_last5   = 0.2,
-                    best_quali_lap   = 90.0,
-                )
-    except Exception:
-        pass
-
-    for raw_num, code in list(num_to_code.items()):
-        if raw_num in pre_race_ctx and code != raw_num:
-            pre_race_ctx[code] = pre_race_ctx.pop(raw_num)
-            pre_race_ctx[code]["driver_code"] = code
-
-    total_laps = RACE_LAPS.get(event, 0)
-    if total_laps == 0:
-        try:
-            total_df = ch.query_df(
-                """
-                SELECT max(LapNumber) AS max_lap
-                FROM raw_telemetry
-                WHERE event   = {event:String}
-                  AND year    = {year:Int32}
-                  AND session = {session:String}
-                """,
-                parameters={"event": event, "year": int(year), "session": str(session)}
-            )
-            if not total_df.empty and pd.notna(total_df.iloc[0]["max_lap"]):
-                total_laps = int(total_df.iloc[0]["max_lap"])
-        except Exception:
-            pass
-
-    normalized_map = {}
-    for raw_num, code in num_to_code.items():
-        n = str(raw_num).strip()
-        c = _normalize_driver_code(code)
-        if n and c:
-            normalized_map[n] = c
-    num_to_code = normalized_map
-
-    normalized_prerace = {}
-    for key, ctx in pre_race_ctx.items():
-        norm_key = _normalize_driver_code(key)
-        if not norm_key:
-            norm_key = _normalize_driver_code(ctx.get("driver_code"))
-        if not norm_key:
-            mapped = num_to_code.get(str(key).strip())
-            norm_key = _normalize_driver_code(mapped)
-        if not norm_key:
-            continue
-        ctx["driver_code"] = norm_key
-        normalized_prerace[norm_key] = ctx
-    pre_race_ctx = normalized_prerace
-
-    return pre_race_ctx, num_to_code, total_laps
+    return io_load_prerace_from_clickhouse(
+        ch=ch,
+        event=event,
+        year=year,
+        session=session,
+        race_laps=RACE_LAPS,
+        canonical_event_name=_canonical_event_name,
+        normalize_driver_code=_normalize_driver_code,
+    )
 
 
 def _clickhouse_lap_to_rows(ch, event: str, year: int, session: str, lap_no: int, num_to_code: dict) -> list:
-    event = _canonical_event_name(event)
-    lap_tele = ch.query_df(
-        """
-        SELECT
-            toString(driver)        AS driver_num,
-            LapNumber,
-            Stint,
-            any(Compound)           AS Compound,
-            avg(Speed)              AS avg_speed,
-            max(Speed)              AS max_speed,
-            avg(Throttle)           AS avg_throttle,
-            avg(Brake)              AS avg_brake,
-            sum(hard_brake)         AS hard_brake_count,
-            sum(full_throttle)      AS full_throttle_count,
-            avg(DRS)                AS avg_drs,
-            avg(RPM)                AS avg_rpm,
-            any(weather)            AS weather,
-            any(TrackTemp)          AS track_temp,
-            any(AirTemp)            AS air_temp,
-            any(Rainfall)           AS rainfall,
-            any(is_pit_lap)         AS is_pit_lap,
-            max(Time_ms)            AS lap_finish_ms,
-            max(RelativeDistance)   AS max_rel_dist
-        FROM raw_telemetry
-        WHERE event      = {event:String}
-          AND year       = {year:Int32}
-          AND session    = {session:String}
-          AND LapNumber  = {lap:Int32}
-        GROUP BY driver_num, LapNumber, Stint
-        ORDER BY LapNumber, driver_num
-        """,
-        parameters={"event": event, "year": int(year), "session": str(session), "lap": int(lap_no)}
+    return io_clickhouse_lap_to_rows(
+        ch=ch,
+        event=event,
+        year=year,
+        session=session,
+        lap_no=lap_no,
+        num_to_code=num_to_code,
+        canonical_event_name=_canonical_event_name,
+        normalize_driver_code=_normalize_driver_code,
     )
-
-    if lap_tele.empty:
-        return []
-
-    def _resolve_driver_code(row):
-        mapped = _normalize_driver_code(num_to_code.get(str(row.get("driver_num")).strip()))
-        if mapped:
-            return mapped
-        return ""
-
-    lap_tele["driver_code"] = lap_tele.apply(_resolve_driver_code, axis=1)
-    return lap_tele.where(pd.notnull(lap_tele), None).to_dict(orient="records")
 
 
 def _load_cumulative_times(ch, event: str, year: int, session: str,
                            up_to_lap: int, num_to_code: dict) -> None:
-    """
-    Pre-populate state['cumulative_time'] and state['laps_completed'] from all
-    historical laps in ClickHouse up to (and including) up_to_lap.
-
-    max(Time_ms) per lap = actual lap duration in ms (Time_ms is lap-relative).
-    Summing across laps gives total race time — the ground-truth position basis.
-
-    Pit-in laps (is_pit_lap=1) get +PIT_STOP_LOSS_S because telemetry is absent
-    during stationary pit service, so max(Time_ms) under-counts those laps.
-    """
-    if up_to_lap < 1:
-        return
     try:
-        df = ch.query_df(
-            f"""
-            SELECT
-                driver_num,
-                sum(case when is_pit = 1
-                         then lap_time_s + {PIT_STOP_LOSS_S}
-                         else lap_time_s
-                    end)            AS total_time_s,
-                max(LapNumber)      AS last_lap,
-                count()             AS laps_done
-            FROM (
-                SELECT
-                    toString(driver)        AS driver_num,
-                    LapNumber,
-                    max(Time_ms) / 1000.0   AS lap_time_s,
-                    any(is_pit_lap)         AS is_pit
-                FROM raw_telemetry
-                WHERE event   = {{event:String}}
-                  AND year    = {{year:Int32}}
-                  AND session = {{session:String}}
-                  AND LapNumber <= {{up_to_lap:Int32}}
-                GROUP BY driver_num, LapNumber
-            )
-            GROUP BY driver_num
-            """,
-            parameters={"event": event, "year": int(year), "session": str(session), "up_to_lap": int(up_to_lap)}
+        loaded = io_load_cumulative_times(
+            ch=ch,
+            event=event,
+            year=year,
+            session=session,
+            up_to_lap=up_to_lap,
+            num_to_code=num_to_code,
+            pit_stop_loss_s=PIT_STOP_LOSS_S,
         )
-        for _, row in df.iterrows():
-            code = num_to_code.get(str(row["driver_num"]), str(row["driver_num"]))
-            t    = float(row["total_time_s"])
-            lap  = int(row["last_lap"])
+        for code, (t, lap) in loaded.items():
             if t > 0:
-                state["cumulative_time"][code]   = t
-                state["laps_completed"][code]    = lap
+                state["cumulative_time"][code] = t
+                state["laps_completed"][code] = lap
         state["_cumul_laps_counted"] = int(up_to_lap)
-        n   = len(df)
+        n = len(loaded)
         msg = (f"  ⏱  Pre-loaded cumulative race times for {n} drivers "
                f"(laps 1–{up_to_lap}, using actual lap durations from telemetry)")
         (console.print(f"[cyan]{msg}[/cyan]") if HAS_RICH else print(msg))
@@ -2782,23 +1923,8 @@ def _load_cumulative_times(ch, event: str, year: int, session: str,
         logger.warning(f"Could not pre-load cumulative times: {exc}")
 
 
-
 def _clickhouse_max_lap(ch, event: str, year: int, session: str) -> int:
-    df = ch.query_df(
-        """
-        SELECT max(LapNumber) AS max_lap
-        FROM raw_telemetry
-        WHERE event   = {event:String}
-          AND year    = {year:Int32}
-          AND session = {session:String}
-        """,
-        parameters={"event": event, "year": int(year), "session": str(session)}
-    )
-    if df.empty or pd.isna(df.iloc[0]["max_lap"]):
-        return 0
-    return int(df.iloc[0]["max_lap"])
-
-
+    return io_clickhouse_max_lap(ch=ch, event=event, year=year, session=session)
 def _clickhouse_live_loop() -> None:
     if not args.event or not args.year:
         raise SystemExit("--clickhouse-live requires --event and --year (or env F1_EVENT/F1_YEAR)")
@@ -3008,7 +2134,7 @@ def main() -> None:
                 )
                                                       
             _pred_client.command(f"""
-                CREATE TABLE IF NOT EXISTS {_pred_table}
+                create table IF NOT EXISTS {_pred_table}
                 (
                     ts             DateTime,
                     event          String,
@@ -3031,11 +2157,11 @@ def main() -> None:
                     gap_to_leader  Float32
                 )
                 ENGINE = MergeTree
-                PARTITION BY (year, event)
-                ORDER BY (event, year, session, lap_no, driver_code)
+                partition by (year, event)
+                order by (event, year, session, lap_no, driver_code)
             """)
-            _pred_client.command(f"ALTER TABLE {_pred_table} ADD COLUMN IF NOT EXISTS speed_rank UInt8")
-            _pred_client.command(f"ALTER TABLE {_pred_table} ADD COLUMN IF NOT EXISTS gap_to_leader Float32")
+            _pred_client.command(f"alter table {_pred_table} ADD COLUMN IF NOT EXISTS speed_rank UInt8")
+            _pred_client.command(f"alter table {_pred_table} ADD COLUMN IF NOT EXISTS gap_to_leader Float32")
             msg = f"  ✓ Prediction output enabled: {args.preds_table}"
             (console.print(f"[green]{msg}[/green]") if HAS_RICH else print(msg))
         except Exception as e:
@@ -3053,3 +2179,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
