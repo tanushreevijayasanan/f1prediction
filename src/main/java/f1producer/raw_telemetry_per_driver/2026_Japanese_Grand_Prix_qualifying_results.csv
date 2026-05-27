@@ -1,0 +1,23 @@
+driver,driver_code,team,grid_position,Q1,Q2,Q3,best_quali_lap,event,year
+12,ANT,Mercedes,1.0,90.035,89.048,88.778,88.778,Japanese Grand Prix,2026
+63,RUS,Mercedes,2.0,89.967,89.686,89.076,89.076,Japanese Grand Prix,2026
+81,PIA,McLaren,3.0,90.2,89.451,89.132,89.132,Japanese Grand Prix,2026
+16,LEC,Ferrari,4.0,89.915,89.303,89.405,89.303,Japanese Grand Prix,2026
+1,NOR,McLaren,5.0,90.401,89.795,89.409,89.409,Japanese Grand Prix,2026
+44,HAM,Ferrari,6.0,90.309,89.589,89.567,89.567,Japanese Grand Prix,2026
+10,GAS,Alpine,7.0,90.584,89.874,89.691,89.691,Japanese Grand Prix,2026
+6,HAD,Red Bull Racing,8.0,90.662,90.104,89.978,89.978,Japanese Grand Prix,2026
+5,BOR,Audi,9.0,90.359,89.99,90.274,89.99,Japanese Grand Prix,2026
+41,LIN,Racing Bulls,10.0,90.781,90.109,90.319,90.109,Japanese Grand Prix,2026
+3,VER,Red Bull Racing,11.0,90.519,90.262,0.0,90.262,Japanese Grand Prix,2026
+31,OCO,Haas F1 Team,12.0,90.915,90.309,0.0,90.309,Japanese Grand Prix,2026
+27,HUL,Audi,13.0,90.358,90.387,0.0,90.358,Japanese Grand Prix,2026
+30,LAW,Racing Bulls,14.0,90.657,90.495,0.0,90.495,Japanese Grand Prix,2026
+43,COL,Alpine,15.0,90.931,90.627,0.0,90.627,Japanese Grand Prix,2026
+55,SAI,Williams,16.0,90.927,91.033,0.0,90.927,Japanese Grand Prix,2026
+23,ALB,Williams,17.0,91.088,0.0,0.0,91.088,Japanese Grand Prix,2026
+87,BEA,Haas F1 Team,18.0,91.09,0.0,0.0,91.09,Japanese Grand Prix,2026
+11,PER,Cadillac,19.0,92.206,0.0,0.0,92.206,Japanese Grand Prix,2026
+77,BOT,Cadillac,20.0,92.33,0.0,0.0,92.33,Japanese Grand Prix,2026
+14,ALO,Aston Martin,21.0,92.646,0.0,0.0,92.646,Japanese Grand Prix,2026
+18,STR,Aston Martin,22.0,92.92,0.0,0.0,92.92,Japanese Grand Prix,2026

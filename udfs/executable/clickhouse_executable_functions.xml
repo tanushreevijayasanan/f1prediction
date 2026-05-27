@@ -1,0 +1,117 @@
+<!--
+  Place this file under ClickHouse config.d/, for example:
+    /etc/clickhouse-server/config.d/f1_executable_udfs.xml
+
+  Ensure scripts are available in:
+    /var/lib/clickhouse/user_scripts/
+  and model pickle artifacts are available in:
+    /var/lib/clickhouse/user_scripts/models/
+-->
+<clickhouse>
+  <user_defined_executable_functions_config>*_executable_functions.xml</user_defined_executable_functions_config>
+
+  <functions>
+    <function>
+      <name>f1_win_probability_exec</name>
+      <type>executable</type>
+      <command>python3 /var/lib/clickhouse/user_scripts/winner_exec_udf.py</command>
+      <format>TabSeparated</format>
+      <return_type>Float64</return_type>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+    </function>
+
+    <function>
+      <name>f1_pit_probability_exec</name>
+      <type>executable</type>
+      <command>python3 /var/lib/clickhouse/user_scripts/pit_exec_udf.py</command>
+      <format>TabSeparated</format>
+      <return_type>Float64</return_type>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+    </function>
+
+    <function>
+      <name>f1_pace_prediction_exec</name>
+      <type>executable</type>
+      <command>python3 /var/lib/clickhouse/user_scripts/pace_exec_udf.py</command>
+      <format>TabSeparated</format>
+      <return_type>Float64</return_type>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+      <argument><type>Float64</type></argument>
+    </function>
+  </functions>
+</clickhouse>

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>F1 Live Telemetry Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=Teko:wght@500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="track-noise"></div>
+<div class="dash-root">
+
+  <header class="top-bar">
+    <div class="top-bar-left">
+      <div class="f1-logo-wrap">
+        <div class="f1-logo">F1</div>
+        <span class="session-chip">RACE CONTROL</span>
+      </div>
+      <div class="race-info">
+        <span class="race-name" id="race-name">Grand Prix</span>
+        <span class="race-meta" id="race-meta">Race - Connecting...</span>
+      </div>
+    </div>
+
+    <div class="top-bar-center">
+      <div class="start-lights" aria-label="race start lights">
+        <span class="light-dot on"></span>
+        <span class="light-dot on"></span>
+        <span class="light-dot on"></span>
+        <span class="light-dot on"></span>
+        <span class="light-dot on"></span>
+      </div>
+      <div class="lap-display">
+        <span class="lap-label">Lap</span>
+        <span class="lap-number" id="hdr-lap">-</span>
+        <span class="lap-total">/ 50</span>
+      </div>
+      <div class="sc-banner" id="sc-banner">
+        <span class="sc-dot"></span>Safety Car
+      </div>
+    </div>
+
+    <div class="top-bar-right">
+      <div class="kpi-pill">
+        <span class="kpi-pill-val" id="hdr-tspeed">-</span>
+        <span class="kpi-pill-label">top km/h</span>
+      </div>
+      <div class="kpi-pill">
+        <span class="kpi-pill-val" id="hdr-avgspeed">-</span>
+        <span class="kpi-pill-label">avg km/h</span>
+      </div>
+      <div class="kpi-pill">
+        <span class="kpi-pill-val" id="hdr-avglap">-</span>
+        <span class="kpi-pill-label">avg lap s</span>
+      </div>
+      <div class="conn-status">
+        <span class="conn-dot" id="conn-dot"></span>
+        <span id="conn-label">Connecting</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="main-grid">
+    <div class="col-left">
+      <section class="panel panel-table">
+        <div class="panel-header">
+          <span class="panel-title">Live Standings</span>
+          <span class="live-badge">LIVE</span>
+        </div>
+        <div class="table-wrap">
+          <table class="lb-table">
+            <thead>
+              <tr>
+                <th>Pos</th>
+                <th>Driver</th>
+                <th>Win %</th>
+                <th>Pred P</th>
+                <th>Pace</th>
+                <th>Tire</th>
+                <th>Age</th>
+                <th>Deg d</th>
+                <th>Curr LT</th>
+                <th>Next LT</th>
+                <th>Gap</th>
+                <th>Pit %</th>
+                <th>!</th>
+              </tr>
+            </thead>
+            <tbody id="lb-body">
+              <tr><td colspan="13" class="empty-state">Awaiting data...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="chart-row-2">
+        <section class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Lap Time Evolution</span>
+            <div class="legend" id="laptime-legend"></div>
+          </div>
+          <div class="chart-box"><canvas id="lapTimeChart" role="img" aria-label="Lap time per driver over laps"></canvas></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Corners: Speed and Throttle</span>
+            <div class="legend">
+              <span class="leg-item"><span class="leg-line" style="background:#0ea5e9"></span>Speed</span>
+              <span class="leg-item"><span class="leg-block" style="background:#ff7a18"></span>Throttle</span>
+            </div>
+          </div>
+          <div class="chart-box"><canvas id="cornerChart" role="img" aria-label="Average speed and throttle per corner"></canvas></div>
+        </section>
+      </div>
+
+      <div class="chart-row-2">
+        <section class="panel">
+          <div class="panel-header">
+            <span class="panel-title">DRS Zones and Speed Trace</span>
+            <div class="legend">
+              <span class="leg-item"><span class="leg-line" style="background:#0ea5e9"></span>Speed</span>
+              <span class="leg-item"><span class="leg-block" style="background:#ff7a18;opacity:.75"></span>DRS</span>
+            </div>
+          </div>
+          <div class="chart-box"><canvas id="drsChart" role="img" aria-label="Speed trace with DRS zones"></canvas></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Tire Pace Evolution</span>
+            <div class="legend" id="tire-legend"></div>
+          </div>
+          <div class="chart-box"><canvas id="tireChart" role="img" aria-label="Tire pace by compound over laps"></canvas></div>
+        </section>
+      </div>
+
+      <div class="chart-row-2">
+        <section class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Win Probability (Rolling 20 Laps)</span>
+            <div class="legend" id="winprob-legend"></div>
+          </div>
+          <div class="chart-box"><canvas id="winProbChart" role="img" aria-label="Win probability per driver over laps"></canvas></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header">
+            <span class="panel-title">Driver Aggression</span>
+            <div class="legend">
+              <span class="leg-item"><span class="leg-block" style="background:#0ea5e9"></span>Throttle avg</span>
+              <span class="leg-item"><span class="leg-block" style="background:#ff7a18"></span>Hard brakes</span>
+            </div>
+          </div>
+          <div class="chart-box"><canvas id="aggrChart" role="img" aria-label="Driver aggression: throttle and hard braking"></canvas></div>
+        </section>
+      </div>
+    </div>
+
+    <div class="col-right">
+      <section class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Live Commentary</span>
+          <span class="ai-badge">AI</span>
+        </div>
+        <div class="commentary-feed" id="commentary-feed">
+          <div class="commentary-item">
+            <span class="comm-lap">Lap -</span>
+            <span class="comm-text">Awaiting live updates...</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Pit Strategy Radar</span>
+        </div>
+        <div id="pit-alerts"></div>
+        <div id="pit-list"><div class="pit-empty">No data yet</div></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Race Aggregates</span>
+        </div>
+        <div class="agg-grid">
+          <div class="agg-card">
+            <span class="agg-label">Avg delta speed</span>
+            <span class="agg-val" id="avg-speed">-</span>
+          </div>
+          <div class="agg-card">
+            <span class="agg-label">Leader gap</span>
+            <span class="agg-val" id="leader-gap">-</span>
+          </div>
+          <div class="agg-card">
+            <span class="agg-label">Pit stops flagged</span>
+            <span class="agg-val" id="pit-count">-</span>
+          </div>
+          <div class="agg-card">
+            <span class="agg-label">Safety car</span>
+            <span class="agg-val" id="sc-active">No</span>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<script src="/static/app.js"></script>
+
+<!-- ── LibreChat floating button + drawer ─────────────────────────────── -->
+<button id="chat-fab" class="chat-fab" aria-label="Open AI Race Analyst" title="Ask the AI Race Analyst">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+  </svg>
+  <span class="chat-fab-label">AI Analyst</span>
+</button>
+
+<div id="chat-drawer" class="chat-drawer" aria-hidden="true">
+  <div class="chat-drawer-header">
+    <div class="chat-drawer-title">
+      <span class="chat-drawer-dot"></span>
+      AI Race Analyst
+    </div>
+    <button id="chat-close" class="chat-close" aria-label="Close AI analyst">&times;</button>
+  </div>
+  <iframe
+    id="chat-frame"
+    class="chat-frame"
+    title="LibreChat AI Race Analyst"
+    allow="clipboard-write"
+  ></iframe>
+</div>
+
+<div id="chat-backdrop" class="chat-backdrop"></div>
+
+<script>
+  (function () {
+    const LIBRECHAT_URL = 'http://localhost:3080';
+    const fab      = document.getElementById('chat-fab');
+    const drawer   = document.getElementById('chat-drawer');
+    const backdrop = document.getElementById('chat-backdrop');
+    const frame    = document.getElementById('chat-frame');
+    const closeBtn = document.getElementById('chat-close');
+    let loaded = false;
+
+    function openChat() {
+      if (!loaded) {
+        frame.src = LIBRECHAT_URL;
+        loaded = true;
+      }
+      drawer.classList.add('open');
+      backdrop.classList.add('visible');
+      drawer.setAttribute('aria-hidden', 'false');
+      fab.classList.add('active');
+    }
+
+    function closeChat() {
+      drawer.classList.remove('open');
+      backdrop.classList.remove('visible');
+      drawer.setAttribute('aria-hidden', 'true');
+      fab.classList.remove('active');
+    }
+
+    fab.addEventListener('click', function() {
+      drawer.classList.contains('open') ? closeChat() : openChat();
+    });
+    closeBtn.addEventListener('click', closeChat);
+    backdrop.addEventListener('click', closeChat);
+  })();
+</script>
+</body>
+</html>

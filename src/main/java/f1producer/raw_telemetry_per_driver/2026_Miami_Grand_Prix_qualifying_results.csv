@@ -1,0 +1,23 @@
+driver,driver_name,driver_code,team,grid_position,Q1,Q2,Q3,best_quali_lap,event,year
+12,Kimi Antonelli,ANT,Mercedes,1.0,88.653,88.289,87.798,87.798,Miami Grand Prix,2026
+3,Max Verstappen,VER,Red Bull Racing,2.0,89.099,88.116,87.964,87.964,Miami Grand Prix,2026
+16,Charles Leclerc,LEC,Ferrari,3.0,88.938,88.315,88.143,88.143,Miami Grand Prix,2026
+1,Lando Norris,NOR,McLaren,4.0,89.183,88.92,88.183,88.183,Miami Grand Prix,2026
+63,George Russell,RUS,Mercedes,5.0,89.492,88.477,88.197,88.197,Miami Grand Prix,2026
+44,Lewis Hamilton,HAM,Ferrari,6.0,89.483,88.477,88.319,88.319,Miami Grand Prix,2026
+81,Oscar Piastri,PIA,McLaren,7.0,89.92,88.332,88.5,88.332,Miami Grand Prix,2026
+43,Franco Colapinto,COL,Alpine,8.0,89.584,88.975,88.762,88.762,Miami Grand Prix,2026
+10,Pierre Gasly,GAS,Alpine,9.0,89.914,89.07,88.81,88.81,Miami Grand Prix,2026
+27,Nico Hulkenberg,HUL,Audi,10.0,89.645,89.439,,89.439,Miami Grand Prix,2026
+30,Liam Lawson,LAW,Racing Bulls,11.0,89.595,89.499,,89.499,Miami Grand Prix,2026
+87,Oliver Bearman,BEA,Haas F1 Team,12.0,89.34,89.567,,89.34,Miami Grand Prix,2026
+55,Carlos Sainz,SAI,Williams,13.0,89.54,89.568,,89.54,Miami Grand Prix,2026
+31,Esteban Ocon,OCO,Haas F1 Team,14.0,89.838,89.772,,89.772,Miami Grand Prix,2026
+23,Alexander Albon,ALB,Williams,15.0,89.72,89.946,,89.72,Miami Grand Prix,2026
+41,Arvid Lindblad,LIN,Racing Bulls,16.0,90.133,,,90.133,Miami Grand Prix,2026
+14,Fernando Alonso,ALO,Aston Martin,17.0,91.098,,,91.098,Miami Grand Prix,2026
+18,Lance Stroll,STR,Aston Martin,18.0,91.164,,,91.164,Miami Grand Prix,2026
+77,Valtteri Bottas,BOT,Cadillac,19.0,91.629,,,91.629,Miami Grand Prix,2026
+11,Sergio Perez,PER,Cadillac,20.0,91.967,,,91.967,Miami Grand Prix,2026
+5,Gabriel Bortoleto,BOR,Audi,21.0,93.737,,,93.737,Miami Grand Prix,2026
+6,Isack Hadjar,HAD,Red Bull Racing,22.0,,88.941,88.789,88.789,Miami Grand Prix,2026

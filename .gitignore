@@ -1,0 +1,7 @@
+target/
+tmp_models/
+udfs/executable/venv_train/
+__pycache__/
+*.pyc
+.DS_Store
+src/main/java/f1producer/f1_cache/*.sqlite
